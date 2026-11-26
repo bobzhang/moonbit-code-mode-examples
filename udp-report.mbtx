@@ -1,0 +1,78 @@
+----
+import {
+  "moonbitlang/core/encoding/utf8",
+  "moonbitlang/core/string",
+}
+----
+
+// Run with: moonx udp-report.mbtx
+enum Metric {
+  Counter(String, Int64)
+  Gauge(String, Int64)
+}
+
+fn statsd_payload(packet : BytesView) -> BytesView? {
+  // IPv4, no fragments, UDP (protocol 17).
+  guard packet is [
+    u4be(4), u4be(ihl), _, u16be(total), u16be(_),
+    u2be(_), u1be(0), u13be(0), _, 17, ..
+  ] else { return None }
+  let start = ihl.reinterpret_as_int() * 4
+  let end = total.reinterpret_as_int()
+  guard 20 <= start && start <= end && end <= packet.length() else { return None }
+  // Read the UDP destination port and length, then take a view of its payload.
+  guard packet[start:end] is [u16be(_), u16be(8125), u16be(len), u16be(_), ..] else {
+    return None
+  }
+  let len = len.reinterpret_as_int()
+  guard 8 <= len && len <= end - start else { return None }
+  Some(packet[start + 8:start + len])
+}
+
+fn read_metric(payload : BytesView) -> Metric? {
+  let text = @utf8.decode(payload) catch { _ => return None }
+  let scanner = StringScanner(text)
+  lexscan scanner {
+    (re"^[a-zA-Z0-9_.]+" as name) + re":" + (re"[0-9]+" as digits) + re"[|]" => {
+      let n = @string.parse_int64(digits) catch { _ => return None }
+      lexscan scanner {
+        re"^c$" => Some(Counter(name.to_owned(), n))
+        re"^g$" => Some(Gauge(name.to_owned(), n))
+        _ => None
+      }
+    }
+    _ => None
+  }
+}
+
+fn summarize(records : Array[(Json, BytesView)]) -> (Map[String, Int64], Map[String, Int64]) {
+  let counters = Map([])
+  let gauges = Map([])
+  for (meta, packet) in records {
+    guard meta is { "direction": "out", .. } else { continue }
+    guard statsd_payload(packet) is Some(payload) else { continue }
+    match read_metric(payload) {
+      Some(Counter(name, delta)) => counters[name] = counters.get(name).unwrap_or(0L) + delta
+      Some(Gauge(name, value)) => gauges[name] = value
+      None => ()
+    }
+  }
+  (counters, gauges)
+}
+
+fn main {
+  // All the sample metric strings are eight bytes, so they share these IPv4 and UDP headers.
+  let headers = b"\x45\x00\x00\x24\x00\x01\x40\x00\x40\x11\x4e\x91\xc0\x00\x02\x01\xc6\x33\x64\x02" +
+    b"\xc3\x50\x1f\xbd\x00\x10\x00\x00"
+  let out : Json = { "direction": "out" }
+  let inbound : Json = { "direction": "in" }
+  let (counters, gauges) = summarize([
+    (out, headers + b"hits:2|c"),
+    (out, headers + b"load:7|g"),
+    (out, headers + b"hits:3|c"),
+    (out, headers + b"load:4|g"),
+    (inbound, headers + b"hits:9|c"),
+  ])
+  for name, total in counters { println("counter \{name} = \{total}") }
+  for name, latest in gauges { println("gauge \{name} = \{latest}") }
+}
